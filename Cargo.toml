@@ -1,0 +1,38 @@
+[package]
+name = "bitcoin-rust"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "A Bitcoin full node implementation in Rust"
+license = "MIT"
+
+[dependencies]
+# Core Bitcoin dependencies
+bitcoin = "0.31"
+secp256k1 = { version = "0.28", features = ["rand", "recovery"] }
+
+# Async runtime and networking
+tokio = { version = "1.0", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging and diagnostics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Database storage
+rocksdb = "0.21"
+
+# Network and I/O
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Additional utilities
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+rand = "0.8"
+
+[dev-dependencies]
+tokio-test = "0.4"
