@@ -4,5 +4,6 @@
 pub mod peer;
 pub mod message;
 pub mod peer_manager;
+pub mod handshake;
 
 // TODO: Implement P2P networking components in Phase 1.2
