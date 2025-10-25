@@ -7,7 +7,6 @@ use crate::network::{
     message::NetworkAddress,
 };
 use std::time::Duration;
-use tokio::net::TcpStream;
 use tokio::time::{interval, sleep};
 use tracing::{info, warn, error, debug};
 use thiserror::Error;
@@ -39,6 +38,7 @@ impl NetworkService {
             config.max_peers,
             Duration::from_secs(300), // 5 minutes connection timeout
             Duration::from_secs(30),  // 30 seconds keepalive interval
+            0.5, // 50% quality threshold
         );
 
         Self {
@@ -139,19 +139,16 @@ impl NetworkService {
         // Add peer to manager
         let connection_id = self.peer_manager.add_peer(address.clone())?;
 
-        // Attempt TCP connection
-        let socket_addr = format!("{}:{}", format_ipv6_mapped_ipv4(&address.ip), address.port);
-
-        match TcpStream::connect(&socket_addr).await {
-            Ok(_stream) => {
-                debug!("TCP connection established to {}", socket_addr);
+        // Attempt TCP connection using the peer's connect method
+        match self.peer_manager.connect_peer(&connection_id).await {
+            Ok(_) => {
+                debug!("TCP connection established to {}:{}",
+                       format_ipv6_mapped_ipv4(&address.ip), address.port);
 
                 // Start handshake
                 match self.peer_manager.start_handshake(&connection_id) {
                     Ok(_version_msg) => {
                         debug!("Handshake initiated with peer {}", connection_id);
-                        // TODO: In a real implementation, we would handle the TCP stream here
-                        // For now, we just mark the connection as established
                         Ok(connection_id)
                     }
                     Err(e) => {
@@ -162,9 +159,10 @@ impl NetworkService {
                 }
             }
             Err(e) => {
-                debug!("Failed to establish TCP connection to {}: {}", socket_addr, e);
+                debug!("Failed to establish TCP connection to {}:{}: {}",
+                       format_ipv6_mapped_ipv4(&address.ip), address.port, e);
                 let _ = self.peer_manager.remove_peer(&connection_id);
-                Err(NetworkServiceError::Io(e))
+                Err(NetworkServiceError::Service(format!("Connection failed: {}", e)))
             }
         }
     }
@@ -181,6 +179,8 @@ impl NetworkService {
         let mut keepalive_interval = interval(Duration::from_secs(30));
         let mut cleanup_interval = interval(Duration::from_secs(60));
         let mut discovery_interval = interval(Duration::from_secs(300)); // 5 minutes
+        let mut reconnect_interval = interval(Duration::from_secs(10)); // 10 seconds
+        let mut quality_update_interval = interval(Duration::from_secs(120)); // 2 minutes
 
         loop {
             if !self.is_running {
@@ -196,6 +196,16 @@ impl NetworkService {
                 // Clean up timed out peers
                 _ = cleanup_interval.tick() => {
                     self.cleanup_timed_out_peers().await;
+                }
+
+                // Handle peer reconnections
+                _ = reconnect_interval.tick() => {
+                    self.handle_peer_reconnections().await;
+                }
+
+                // Update peer quality metrics
+                _ = quality_update_interval.tick() => {
+                    self.update_peer_qualities().await;
                 }
 
                 // Periodic peer discovery
@@ -239,6 +249,75 @@ impl NetworkService {
                 debug!("Removed timed out peer: {}", peer_id);
             }
         }
+    }
+
+    /// Handle peer reconnections
+    async fn handle_peer_reconnections(&mut self) {
+        let reconnect_peers = self.peer_manager.get_peers_needing_reconnect();
+
+        if !reconnect_peers.is_empty() {
+            debug!("Attempting to reconnect {} peers", reconnect_peers.len());
+
+            for connection_id in reconnect_peers {
+                match self.peer_manager.connect_peer(&connection_id).await {
+                    Ok(_) => {
+                        debug!("Successfully reconnected peer {}", connection_id);
+                        // Start handshake for reconnected peer
+                        if let Err(e) = self.peer_manager.start_handshake(&connection_id) {
+                            warn!("Failed to start handshake for reconnected peer {}: {}", connection_id, e);
+                        }
+                    }
+                    Err(e) => {
+                        debug!("Failed to reconnect peer {}: {}", connection_id, e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Update peer quality metrics
+    async fn update_peer_qualities(&mut self) {
+        self.peer_manager.update_peer_qualities();
+
+        // Log peer quality statistics
+        let qualities = self.peer_manager.get_peers_by_quality();
+        if !qualities.is_empty() {
+            let avg_quality = qualities.iter().map(|(_, q)| q).sum::<f64>() / qualities.len() as f64;
+            debug!("Peer quality update: {} connected peers, average quality: {:.2}",
+                   qualities.len(), avg_quality);
+
+            // Log top 3 peers by quality
+            for (i, (connection_id, quality)) in qualities.iter().take(3).enumerate() {
+                debug!("Top peer #{}: {} (quality: {:.2})", i + 1, connection_id, quality);
+            }
+        }
+    }
+
+    /// Get the best peers for specific operations
+    pub fn get_best_peers(&self, count: usize) -> Vec<String> {
+        self.peer_manager.get_best_peers(count)
+    }
+
+    /// Get peer quality statistics
+    pub fn get_peer_quality_stats(&self) -> Vec<(String, f64)> {
+        self.peer_manager.get_peers_by_quality()
+    }
+
+    /// Get peers by connection state
+    pub fn get_peers_by_state(&self, state: crate::network::peer::ConnectionState) -> Vec<String> {
+        self.peer_manager.get_peers_by_state(state)
+    }
+
+    /// Disconnect a specific peer
+    pub async fn disconnect_peer(&mut self, connection_id: &str) -> Result<(), NetworkServiceError> {
+        self.peer_manager.disconnect_peer(connection_id).await?;
+        Ok(())
+    }
+
+    /// Send a message to a specific peer
+    pub async fn send_message_to_peer(&mut self, connection_id: &str, message: crate::network::message::Message) -> Result<(), NetworkServiceError> {
+        self.peer_manager.send_message(connection_id, message).await?;
+        Ok(())
     }
 }
 
@@ -291,7 +370,7 @@ mod tests {
     #[test]
     fn test_network_service_start_stop() {
         let config = create_test_config();
-        let mut service = NetworkService::new(config);
+        let service = NetworkService::new(config);
 
         assert!(!service.is_running());
 

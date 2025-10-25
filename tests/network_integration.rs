@@ -1,8 +1,8 @@
 // Integration test for network functionality
 // This test verifies that the network service can discover peers and establish connections
 
-use bitcoin_rust::network::{DnsSeedResolver, NetworkService};
-use bitcoin_rust::config::{Config, Network};
+use bitcoin_rs::network::{DnsSeedResolver, NetworkService};
+use bitcoin_rs::config::{Config, Network};
 
 #[tokio::test]
 async fn test_dns_seed_resolution() {

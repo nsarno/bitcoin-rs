@@ -1,8 +1,9 @@
 // Bitcoin keepalive peer integration tests
 // This file contains end-to-end tests for complete peer management workflows
 
-use bitcoin_rust::network::message::{Message, NetworkAddress, MessageCodec, PongMessage};
-use bitcoin_rust::network::peer_manager::{PeerManager, PeerState};
+use bitcoin_rs::network::message::{Message, NetworkAddress, MessageCodec, PongMessage};
+use bitcoin_rs::network::peer_manager::{PeerManager};
+use bitcoin_rs::network::peer::{ConnectionState};
 use std::time::Duration;
 
 /// Create a test network address
@@ -24,12 +25,17 @@ fn test_complete_keepalive_flow() {
     let connection_id = peer_manager.add_peer(address).expect("Failed to add peer");
     assert_eq!(peer_manager.total_peer_count(), 1);
 
+    // Manually set peer to handshaking state for testing
+    if let Some(peer) = peer_manager.get_peer_mut(&connection_id) {
+        peer.state = ConnectionState::Handshaking;
+    }
+
     // Start handshake
     let version_msg = peer_manager.start_handshake(&connection_id).expect("Failed to start handshake");
     assert!(matches!(version_msg, Message::Version(_)));
 
     // Simulate peer responding with version
-    let peer_version = bitcoin_rust::network::message::VersionMessage {
+    let peer_version = bitcoin_rs::network::message::VersionMessage {
         version: 70015,
         services: 1,
         timestamp: 1234567890,
@@ -74,7 +80,7 @@ fn test_complete_keepalive_flow() {
 
     // Check that handshake is complete
     let peer = peer_manager.get_peer(&connection_id).expect("Peer not found");
-    assert_eq!(peer.state, PeerState::Connected);
+    assert_eq!(peer.state, ConnectionState::Connected);
 
     // Now test keepalive functionality
     // Generate a ping
@@ -116,7 +122,7 @@ fn test_complete_keepalive_flow() {
     let stats = peer_manager.get_all_peer_stats();
     assert_eq!(stats.len(), 1);
     assert_eq!(stats[0].connection_id, connection_id);
-    assert_eq!(stats[0].state, PeerState::Connected);
+    assert_eq!(stats[0].state, ConnectionState::Connected);
     assert!(stats[0].is_alive);
 }
 
@@ -155,7 +161,7 @@ fn test_keepalive_multiple_peers() {
     // Set all peers to connected state for testing
     for connection_id in &connection_ids {
         if let Some(peer) = peer_manager.get_peer_mut(connection_id) {
-            peer.state = PeerState::Connected;
+            peer.state = ConnectionState::Connected;
         }
     }
 
@@ -182,7 +188,7 @@ fn test_keepalive_multiple_peers() {
     assert_eq!(stats.len(), 3);
     for stat in stats {
         assert!(stat.is_alive);
-        assert_eq!(stat.state, PeerState::Connected);
+        assert_eq!(stat.state, ConnectionState::Connected);
     }
 }
 
@@ -196,7 +202,7 @@ fn test_keepalive_error_handling() {
 
     // Set peer to connected state
     if let Some(peer) = peer_manager.get_peer_mut(&connection_id) {
-        peer.state = PeerState::Connected;
+        peer.state = ConnectionState::Connected;
     }
 
     // Generate a ping
@@ -232,7 +238,7 @@ fn test_keepalive_message_format_compliance() {
 
     // Set peer to connected state
     if let Some(peer) = peer_manager.get_peer_mut(&connection_id) {
-        peer.state = PeerState::Connected;
+        peer.state = ConnectionState::Connected;
     }
 
     // Generate a ping
@@ -281,6 +287,7 @@ fn test_keepalive_custom_settings() {
         4, // max_peers
         Duration::from_secs(120), // connection_timeout
         Duration::from_secs(15),  // keepalive_interval
+        0.5, // peer_quality_threshold
     );
 
     assert_eq!(peer_manager.total_peer_count(), 0);
@@ -340,17 +347,17 @@ fn test_keepalive_statistics() {
     let stats = peer_manager.get_all_peer_stats();
     assert_eq!(stats.len(), 1);
     assert_eq!(stats[0].connection_id, connection_id);
-    assert_eq!(stats[0].state, PeerState::Disconnected);
+    assert_eq!(stats[0].state, ConnectionState::Disconnected);
     assert!(!stats[0].is_alive); // Not connected yet
 
     // Set peer to connected state
     if let Some(peer) = peer_manager.get_peer_mut(&connection_id) {
-        peer.state = PeerState::Connected;
+        peer.state = ConnectionState::Connected;
     }
 
     // Get updated stats
     let stats = peer_manager.get_all_peer_stats();
-    assert_eq!(stats[0].state, PeerState::Connected);
+    assert_eq!(stats[0].state, ConnectionState::Connected);
     assert!(stats[0].is_alive);
 
     // Test peer counts
@@ -368,7 +375,7 @@ fn test_keepalive_rapid_cycles() {
 
     // Set peer to connected state
     if let Some(peer) = peer_manager.get_peer_mut(&connection_id) {
-        peer.state = PeerState::Connected;
+        peer.state = ConnectionState::Connected;
     }
 
     // Perform multiple ping/pong cycles

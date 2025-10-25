@@ -1,8 +1,8 @@
 // Integration tests for Bitcoin version handshake
 // This file contains comprehensive tests for the version handshake protocol
 
-use bitcoin_rust::network::handshake::{HandshakeManager, HandshakeState};
-use bitcoin_rust::network::message::{Message, VersionMessage, NetworkAddress, MessageCodec, PingMessage};
+use bitcoin_rs::network::handshake::{HandshakeManager, HandshakeState};
+use bitcoin_rs::network::message::{Message, VersionMessage, NetworkAddress, MessageCodec, PingMessage};
 
 /// Create a test network address for testing
 fn create_test_network_address() -> NetworkAddress {

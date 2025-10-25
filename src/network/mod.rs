@@ -10,6 +10,7 @@ pub mod dns_seeds;
 pub mod service;
 
 // Re-export commonly used types
-pub use peer_manager::{PeerManager, PeerManagerError, PeerState, PeerStats};
+pub use peer_manager::{PeerManager, PeerManagerError};
+pub use peer::{PeerConnection, PeerError, ConnectionState, ConnectionQuality, PeerStats};
 pub use dns_seeds::{DnsSeedResolver, DnsSeedError};
 pub use service::{NetworkService, NetworkServiceError};

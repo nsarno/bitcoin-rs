@@ -1,7 +1,7 @@
 // Bitcoin keepalive management tests
 // This file contains tests for keepalive state management and logic
 
-use bitcoin_rust::network::message::{Message, PingMessage, PongMessage, MessageCodec};
+use bitcoin_rs::network::message::{Message, PingMessage, PongMessage, MessageCodec};
 use std::time::{SystemTime, Duration};
 use std::collections::HashMap;
 

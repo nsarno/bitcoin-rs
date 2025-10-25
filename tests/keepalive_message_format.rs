@@ -1,7 +1,7 @@
 // Bitcoin keepalive message format tests
 // This file contains tests for Bitcoin protocol message format compliance
 
-use bitcoin_rust::network::message::{Message, PingMessage, PongMessage, MessageCodec};
+use bitcoin_rs::network::message::{Message, PingMessage, PongMessage, MessageCodec};
 use std::time::SystemTime;
 
 /// Test ping message creation and serialization
