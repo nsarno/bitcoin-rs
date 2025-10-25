@@ -1,10 +1,15 @@
 // P2P networking module
-// This module will handle peer connections, message serialization, and network protocol
+// This module handles peer connections, message serialization, and network protocol
 
 pub mod peer;
 pub mod message;
 pub mod peer_manager;
 pub mod handshake;
 pub mod keepalive;
+pub mod dns_seeds;
+pub mod service;
 
-// TODO: Implement P2P networking components in Phase 1.2
+// Re-export commonly used types
+pub use peer_manager::{PeerManager, PeerManagerError, PeerState, PeerStats};
+pub use dns_seeds::{DnsSeedResolver, DnsSeedError};
+pub use service::{NetworkService, NetworkServiceError};
