@@ -210,7 +210,7 @@ fn test_version_message_content() {
     // Verify our version message has correct content
     assert_eq!(our_version.version, 70015);
     assert_eq!(our_version.services, 1);
-    assert_eq!(our_version.user_agent, "/bitcoin-rust:0.1.0/");
+    assert_eq!(our_version.user_agent, "/bitcoin-rs:0.1.0/");
     assert_eq!(our_version.start_height, 0);
     assert!(our_version.relay);
     assert_eq!(our_version.addr_recv, peer_addr);

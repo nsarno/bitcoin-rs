@@ -9,7 +9,7 @@ A Bitcoin full node implementation in Rust, built following a phased approach st
 ## Project Structure
 
 ```
-bitcoin-rust/
+bitcoin-rs/
 ├── Cargo.toml
 ├── src/
 │   ├── main.rs              # Entry point

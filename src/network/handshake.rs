@@ -98,7 +98,7 @@ impl HandshakeManager {
                 port: 8333,
             },
             nonce: rand::thread_rng().gen(),
-            user_agent: "/bitcoin-rust:0.1.0/".to_string(),
+            user_agent: "/bitcoin-rs:0.1.0/".to_string(),
             start_height: 0, // We start from genesis
             relay: true,
         };

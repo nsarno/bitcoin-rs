@@ -479,7 +479,7 @@ mod tests {
                 port: 8333,
             },
             nonce: 123456789,
-            user_agent: "/bitcoin-rust:0.1.0/".to_string(),
+            user_agent: "/bitcoin-rs:0.1.0/".to_string(),
             start_height: 0,
             relay: true,
         });
@@ -527,7 +527,7 @@ mod tests {
                 port: 8333,
             },
             nonce: 123456789,
-            user_agent: "/bitcoin-rust:0.1.0/".to_string(),
+            user_agent: "/bitcoin-rs:0.1.0/".to_string(),
             start_height: 0,
             relay: true,
         });
@@ -606,7 +606,7 @@ mod tests {
                 port: 8333,
             },
             nonce: 123456789,
-            user_agent: "/bitcoin-rust:0.1.0/".to_string(),
+            user_agent: "/bitcoin-rs:0.1.0/".to_string(),
             start_height: 0,
             relay: true,
         });

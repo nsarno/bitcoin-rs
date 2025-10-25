@@ -18,7 +18,7 @@ Build a production-ready Bitcoin full node in Rust using established crates, imp
 ### Project Structure
 
 ```
-bitcoin-rust/
+bitcoin-rs/
 ├── Cargo.toml
 ├── src/
 │   ├── main.rs
