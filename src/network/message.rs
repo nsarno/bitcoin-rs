@@ -1,7 +1,8 @@
 // Bitcoin message serialization/deserialization
 // This module handles the Bitcoin P2P protocol message format
 
-use bitcoin::{BlockHash};
+use bitcoin::BlockHash;
+use bitcoin::hashes::Hash;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -77,7 +78,7 @@ pub struct GetHeadersMessage {
 /// Headers message
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeadersMessage {
-    pub headers: Vec<BlockHeader>,
+    pub headers: Vec<bitcoin::block::Header>,
 }
 
 /// Block header structure
@@ -255,9 +256,61 @@ impl MessageCodec {
             Message::Pong(pong) => {
                 payload.extend_from_slice(&pong.nonce.to_le_bytes());
             }
-            _ => {
-                // For now, return empty payload for unimplemented message types
-                // This will be extended as we implement more message types
+            Message::GetHeaders(getheaders) => {
+                payload.extend_from_slice(&getheaders.version.to_le_bytes());
+
+                // Block locator hashes (varint count + hashes)
+                payload.extend_from_slice(&Self::encode_varint(getheaders.block_locator_hashes.len() as u64));
+                for hash in &getheaders.block_locator_hashes {
+                    payload.extend_from_slice(hash.as_ref());
+                }
+
+                // Hash stop
+                payload.extend_from_slice(getheaders.hash_stop.as_ref());
+            }
+            Message::Headers(headers) => {
+                // Headers count (varint)
+                payload.extend_from_slice(&Self::encode_varint(headers.headers.len() as u64));
+
+                // Each header (80 bytes) + tx count (varint, always 0 for headers)
+                for header in &headers.headers {
+                    // Serialize header using bitcoin crate
+                    let header_data = bitcoin::consensus::encode::serialize(header);
+                    payload.extend_from_slice(&header_data);
+
+                    // Transaction count (always 0 for headers message)
+                    payload.extend_from_slice(&Self::encode_varint(0));
+                }
+            }
+            Message::GetData(getdata) => {
+                // Inventory count (varint)
+                payload.extend_from_slice(&Self::encode_varint(getdata.inventory.len() as u64));
+
+                // Each inventory vector
+                for inv in &getdata.inventory {
+                    payload.extend_from_slice(&inv.inv_type.to_le_bytes());
+                    payload.extend_from_slice(&inv.hash);
+                }
+            }
+            Message::Block(block_msg) => {
+                // Serialize the full block using bitcoin crate
+                let block_data = bitcoin::consensus::encode::serialize(&block_msg.block);
+                payload.extend_from_slice(&block_data);
+            }
+            Message::Inv(inv) => {
+                // Inventory count (varint)
+                payload.extend_from_slice(&Self::encode_varint(inv.inventory.len() as u64));
+
+                // Each inventory vector
+                for inv_vec in &inv.inventory {
+                    payload.extend_from_slice(&inv_vec.inv_type.to_le_bytes());
+                    payload.extend_from_slice(&inv_vec.hash);
+                }
+            }
+            Message::Tx(tx_msg) => {
+                // Serialize the transaction using bitcoin crate
+                let tx_data = bitcoin::consensus::encode::serialize(&tx_msg.tx);
+                payload.extend_from_slice(&tx_data);
             }
         }
 
@@ -377,6 +430,142 @@ impl MessageCodec {
                     payload[4], payload[5], payload[6], payload[7]
                 ]);
                 Ok(Message::Pong(PongMessage { nonce }))
+            }
+            "getheaders" => {
+                if payload.len() < 37 { // Minimum: version(4) + 1 hash(32) + hash_stop(32)
+                    return Err(MessageError::InvalidFormat("GetHeaders message too short".to_string()));
+                }
+
+                let mut offset = 0;
+                let version = i32::from_le_bytes([payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3]]);
+                offset += 4;
+
+                // Block locator hashes
+                let (count, varint_size) = Self::decode_varint(&payload[offset..])?;
+                offset += varint_size;
+
+                let mut block_locator_hashes = Vec::new();
+                for _ in 0..count {
+                    if offset + 32 > payload.len() {
+                        return Err(MessageError::InvalidFormat("Insufficient data for block locator hashes".to_string()));
+                    }
+                    let mut hash_bytes = [0u8; 32];
+                    hash_bytes.copy_from_slice(&payload[offset..offset + 32]);
+                    block_locator_hashes.push(BlockHash::from_byte_array(hash_bytes));
+                    offset += 32;
+                }
+
+                // Hash stop
+                if offset + 32 > payload.len() {
+                    return Err(MessageError::InvalidFormat("Insufficient data for hash stop".to_string()));
+                }
+                let mut hash_stop_bytes = [0u8; 32];
+                hash_stop_bytes.copy_from_slice(&payload[offset..offset + 32]);
+                let hash_stop = BlockHash::from_byte_array(hash_stop_bytes);
+
+                Ok(Message::GetHeaders(GetHeadersMessage {
+                    version,
+                    block_locator_hashes,
+                    hash_stop,
+                }))
+            }
+            "headers" => {
+                if payload.len() < 1 {
+                    return Err(MessageError::InvalidFormat("Headers message too short".to_string()));
+                }
+
+                let mut offset = 0;
+                let (count, varint_size) = Self::decode_varint(&payload[offset..])?;
+                offset += varint_size;
+
+                let mut headers = Vec::new();
+                for _ in 0..count {
+                    if offset + 80 > payload.len() {
+                        return Err(MessageError::InvalidFormat("Insufficient data for header".to_string()));
+                    }
+
+                    // Deserialize header using bitcoin crate
+                    let header = bitcoin::consensus::encode::deserialize(&payload[offset..offset + 80])
+                        .map_err(|e| MessageError::InvalidFormat(format!("Header deserialization failed: {}", e)))?;
+                    headers.push(header);
+                    offset += 80;
+
+                    // Skip transaction count (always 0 for headers)
+                    let (_, tx_count_size) = Self::decode_varint(&payload[offset..])?;
+                    offset += tx_count_size;
+                }
+
+                Ok(Message::Headers(HeadersMessage { headers }))
+            }
+            "getdata" => {
+                if payload.len() < 1 {
+                    return Err(MessageError::InvalidFormat("GetData message too short".to_string()));
+                }
+
+                let mut offset = 0;
+                let (count, varint_size) = Self::decode_varint(&payload[offset..])?;
+                offset += varint_size;
+
+                let mut inventory = Vec::new();
+                for _ in 0..count {
+                    if offset + 36 > payload.len() {
+                        return Err(MessageError::InvalidFormat("Insufficient data for inventory vector".to_string()));
+                    }
+
+                    let inv_type = u32::from_le_bytes([
+                        payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3]
+                    ]);
+                    offset += 4;
+
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&payload[offset..offset + 32]);
+                    offset += 32;
+
+                    inventory.push(InventoryVector { inv_type, hash });
+                }
+
+                Ok(Message::GetData(GetDataMessage { inventory }))
+            }
+            "block" => {
+                // Deserialize the full block using bitcoin crate
+                let block = bitcoin::consensus::encode::deserialize(payload)
+                    .map_err(|e| MessageError::InvalidFormat(format!("Block deserialization failed: {}", e)))?;
+                Ok(Message::Block(BlockMessage { block }))
+            }
+            "inv" => {
+                if payload.len() < 1 {
+                    return Err(MessageError::InvalidFormat("Inv message too short".to_string()));
+                }
+
+                let mut offset = 0;
+                let (count, varint_size) = Self::decode_varint(&payload[offset..])?;
+                offset += varint_size;
+
+                let mut inventory = Vec::new();
+                for _ in 0..count {
+                    if offset + 36 > payload.len() {
+                        return Err(MessageError::InvalidFormat("Insufficient data for inventory vector".to_string()));
+                    }
+
+                    let inv_type = u32::from_le_bytes([
+                        payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3]
+                    ]);
+                    offset += 4;
+
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&payload[offset..offset + 32]);
+                    offset += 32;
+
+                    inventory.push(InventoryVector { inv_type, hash });
+                }
+
+                Ok(Message::Inv(InvMessage { inventory }))
+            }
+            "tx" => {
+                // Deserialize the transaction using bitcoin crate
+                let tx = bitcoin::consensus::encode::deserialize(payload)
+                    .map_err(|e| MessageError::InvalidFormat(format!("Transaction deserialization failed: {}", e)))?;
+                Ok(Message::Tx(TxMessage { tx }))
             }
             _ => {
                 Err(MessageError::UnsupportedMessageType(command.to_string()))
