@@ -5,6 +5,8 @@ use bitcoin::{Block, BlockHash};
 use bitcoin::block::Header;
 use crate::storage::{BlockDatabase, DatabaseError};
 use crate::blockchain::block_index::{BlockIndex, BlockIndexError, BlockIndexEntry};
+use crate::blockchain::validation::{ValidationError, validate_block_pow, validate_header_pow};
+use crate::consensus::ConsensusParams;
 use std::path::Path;
 use thiserror::Error;
 
@@ -21,24 +23,50 @@ pub enum BlockchainError {
     BlockNotFound(BlockHash),
     #[error("Invalid block")]
     InvalidBlock,
+    #[error("Validation error: {0}")]
+    Validation(#[from] ValidationError),
 }
 
 /// High-level blockchain interface combining database and index
 pub struct Blockchain {
     index: BlockIndex,
+    consensus_params: ConsensusParams,
 }
 
 impl Blockchain {
-    /// Create a new blockchain instance
+    /// Create a new blockchain instance with default testnet consensus parameters
     pub fn new<P: AsRef<Path>>(data_dir: P) -> Result<Self, BlockchainError> {
+        Self::new_with_consensus(data_dir, ConsensusParams::testnet())
+    }
+
+    /// Create a new blockchain instance with specific consensus parameters
+    pub fn new_with_consensus<P: AsRef<Path>>(data_dir: P, consensus_params: ConsensusParams) -> Result<Self, BlockchainError> {
         let db = BlockDatabase::open(data_dir)?;
         let index = BlockIndex::new(db)?;
 
-        Ok(Blockchain { index })
+        Ok(Blockchain {
+            index,
+            consensus_params,
+        })
     }
 
     /// Add a new block to the blockchain
     pub fn add_block(&mut self, block: &Block) -> Result<(), BlockchainError> {
+        // Validate proof-of-work before accepting the block
+        validate_block_pow(block, &self.consensus_params)?;
+
+        // Store the full block in the database
+        self.index.database().store_block(block)?;
+
+        // Add the header to the index
+        self.index.add_block(block.header)?;
+
+        Ok(())
+    }
+
+    /// Add a new block to the blockchain without PoW validation (for testing)
+    #[cfg(test)]
+    pub fn add_block_without_pow(&mut self, block: &Block) -> Result<(), BlockchainError> {
         // Store the full block in the database
         self.index.database().store_block(block)?;
 
@@ -50,6 +78,16 @@ impl Blockchain {
 
     /// Add only a block header (for headers-first sync)
     pub fn add_header(&mut self, header: &Header) -> Result<(), BlockchainError> {
+        // Validate proof-of-work before accepting the header
+        validate_header_pow(header, &self.consensus_params)?;
+
+        self.index.add_block(header.clone())?;
+        Ok(())
+    }
+
+    /// Add only a block header without PoW validation (for testing)
+    #[cfg(test)]
+    pub fn add_header_without_pow(&mut self, header: &Header) -> Result<(), BlockchainError> {
         self.index.add_block(header.clone())?;
         Ok(())
     }
@@ -132,6 +170,11 @@ impl Blockchain {
     pub fn index(&self) -> &BlockIndex {
         &self.index
     }
+
+    /// Get the consensus parameters for this blockchain
+    pub fn consensus_params(&self) -> &ConsensusParams {
+        &self.consensus_params
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +223,9 @@ mod tests {
 
         assert_eq!(blockchain.get_height(), 0);
         assert!(blockchain.get_tip_hash().is_none());
+
+        // Check that it uses testnet consensus by default
+        assert_eq!(blockchain.consensus_params().network_name, "testnet");
     }
 
     #[test]
@@ -190,8 +236,8 @@ mod tests {
         let block = create_test_block();
         let block_hash = block.block_hash();
 
-        // Add block
-        blockchain.add_block(&block).expect("Failed to add block");
+        // Add block without PoW validation (for testing)
+        blockchain.add_block_without_pow(&block).expect("Failed to add block");
 
         // Retrieve block
         let retrieved_block = blockchain.get_block(&block_hash).expect("Failed to retrieve block");
@@ -208,6 +254,26 @@ mod tests {
     }
 
     #[test]
+    fn test_pow_validation_integration() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut blockchain = Blockchain::new(temp_dir.path()).expect("Failed to create blockchain");
+
+        // Create a block with valid target (but not valid PoW)
+        let block = create_test_block();
+
+        // This should succeed using the test method that bypasses PoW
+        blockchain.add_block_without_pow(&block).expect("Failed to add valid block");
+
+        // Create a block with invalid target
+        let mut invalid_block = create_test_block();
+        invalid_block.header.bits = bitcoin::CompactTarget::from_consensus(0x1bffffff); // Invalid target
+
+        // This should fail with validation error when using the real method
+        let result = blockchain.add_block(&invalid_block);
+        assert!(matches!(result, Err(BlockchainError::Validation(_))));
+    }
+
+    #[test]
     fn test_add_header_only() {
         let temp_dir = TempDir::new().unwrap();
         let mut blockchain = Blockchain::new(temp_dir.path()).expect("Failed to create blockchain");
@@ -216,8 +282,8 @@ mod tests {
         let header = block.header;
         let header_hash = header.block_hash();
 
-        // Add header only
-        blockchain.add_header(&header).expect("Failed to add header");
+        // Add header only without PoW validation (for testing)
+        blockchain.add_header_without_pow(&header).expect("Failed to add header");
 
         // Retrieve header
         let retrieved_header = blockchain.get_header(&header_hash).expect("Failed to retrieve header");
@@ -228,6 +294,27 @@ mod tests {
         let best_header = blockchain.get_best_header().expect("Failed to get best header");
         assert!(best_header.is_some());
         assert_eq!(best_header.unwrap().block_hash(), header_hash);
+    }
+
+    #[test]
+    fn test_header_pow_validation() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut blockchain = Blockchain::new(temp_dir.path()).expect("Failed to create blockchain");
+
+        // Create a header with valid PoW
+        let block = create_test_block();
+        let header = block.header;
+
+        // This should succeed (using test method that bypasses PoW)
+        blockchain.add_header_without_pow(&header).expect("Failed to add valid header");
+
+        // Create a header with invalid PoW
+        let mut invalid_header = header;
+        invalid_header.bits = bitcoin::CompactTarget::from_consensus(0x1cffffff); // Invalid target
+
+        // This should fail with validation error when using the real method
+        let result = blockchain.add_header(&invalid_header);
+        assert!(matches!(result, Err(BlockchainError::Validation(_))));
     }
 
     #[test]
@@ -246,7 +333,7 @@ mod tests {
             let block_hash = block.block_hash();
             blocks.push(block_hash);
 
-            blockchain.add_block(&block).expect("Failed to add block");
+            blockchain.add_block_without_pow(&block).expect("Failed to add block");
             prev_hash = block_hash;
         }
 
@@ -282,7 +369,7 @@ mod tests {
             let block_hash = block.block_hash();
             blocks.push(block_hash);
 
-            blockchain.add_block(&block).expect("Failed to add block");
+            blockchain.add_block_without_pow(&block).expect("Failed to add block");
             prev_hash = block_hash;
         }
 
@@ -302,7 +389,7 @@ mod tests {
 
         // Add some blocks
         let block = create_test_block();
-        blockchain.add_block(&block).expect("Failed to add block");
+        blockchain.add_block_without_pow(&block).expect("Failed to add block");
 
         // Get stats
         let stats = blockchain.get_stats().expect("Failed to get stats");

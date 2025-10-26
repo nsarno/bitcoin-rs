@@ -238,14 +238,22 @@ impl BlockIndex {
         Ok(())
     }
 
-    /// Calculate chainwork for a block (simplified implementation)
+    /// Calculate chainwork for a block using proper difficulty-based calculation
     fn calculate_chainwork(&self, header: &Header) -> u64 {
-        // Simplified chainwork calculation
-        // In reality, this involves the difficulty target and is more complex
+        use crate::blockchain::validation::calculate_work_from_target;
+
+        // Calculate the work for this block based on its target
+        let target = header.target();
+        let block_work = calculate_work_from_target(&target);
+
+        // Add to parent's chainwork
         if let Some(parent_entry) = self.blocks.get(&header.prev_blockhash) {
-            parent_entry.chainwork + 1
+            // Convert u128 to u64, handling overflow by capping at u64::MAX
+            let block_work_u64 = block_work.min(u64::MAX as u128) as u64;
+            parent_entry.chainwork.saturating_add(block_work_u64)
         } else {
-            1
+            // Genesis block or orphan - just the work of this block
+            block_work.min(u64::MAX as u128) as u64
         }
     }
 
