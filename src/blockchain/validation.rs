@@ -1,7 +1,7 @@
 // Block validation logic
 // This module implements proof-of-work verification and other block validation rules
 
-use bitcoin::{Block, Target, CompactTarget, Transaction, TxIn, TxOut, OutPoint, Txid};
+use bitcoin::{Block, Target, CompactTarget, Transaction, Txid};
 use bitcoin::block::Header;
 use bitcoin::consensus::Encodable;
 use crate::consensus::ConsensusParams;
@@ -234,15 +234,32 @@ pub fn validate_block_structure(block: &Block) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// Validate that the block's merkle root matches the calculated merkle tree
+pub fn validate_merkle_root(block: &Block) -> Result<(), ValidationError> {
+    // Calculate the merkle root from the transaction IDs using the block's built-in method
+    let calculated_root = block.compute_merkle_root()
+        .ok_or(ValidationError::InvalidMerkleRoot)?;
+
+    // Compare with the merkle root in the block header
+    if calculated_root != block.header.merkle_root {
+        return Err(ValidationError::InvalidMerkleRoot);
+    }
+
+    Ok(())
+}
+
 /// Comprehensive block validation combining all consensus checks
 pub fn validate_block_consensus(block: &Block, params: &ConsensusParams) -> Result<(), ValidationError> {
     // 1. Block structure validation
     validate_block_structure(block)?;
 
-    // 2. Block size/weight validation
+    // 2. Merkle root validation
+    validate_merkle_root(block)?;
+
+    // 3. Block size/weight validation
     validate_block_size(block, params)?;
 
-    // 3. Proof-of-work validation (already implemented)
+    // 4. Proof-of-work validation (already implemented)
     validate_block_pow(block, params)?;
 
     Ok(())
@@ -268,9 +285,8 @@ mod tests {
         }
     }
 
-    fn create_test_block(prev_hash: BlockHash, nonce: u32, bits: u32) -> Block {
-        let header = create_test_header(prev_hash, nonce, bits);
 
+    fn create_test_block(prev_hash: BlockHash, nonce: u32, bits: u32) -> Block {
         let tx = Transaction {
             version: Version(1),
             lock_time: LockTime::ZERO,
@@ -286,9 +302,33 @@ mod tests {
             }],
         };
 
-        Block {
-            header,
+        // Create a temporary block to calculate the correct merkle root
+        let temp_block = Block {
+            header: Header {
+                version: bitcoin::block::Version::from_consensus(1),
+                prev_blockhash: prev_hash,
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(), // Temporary
+                time: 1234567890,
+                bits: CompactTarget::from_consensus(bits),
+                nonce,
+            },
             txdata: vec![tx],
+        };
+
+        // Calculate the correct merkle root using the block's method
+        let merkle_root = temp_block.compute_merkle_root().unwrap_or_else(|| bitcoin::TxMerkleNode::all_zeros());
+
+        // Create the final block with the correct merkle root
+        Block {
+            header: Header {
+                version: bitcoin::block::Version::from_consensus(1),
+                prev_blockhash: prev_hash,
+                merkle_root,
+                time: 1234567890,
+                bits: CompactTarget::from_consensus(bits),
+                nonce,
+            },
+            txdata: temp_block.txdata,
         }
     }
 
@@ -595,5 +635,95 @@ mod tests {
 
         let size_result = validate_block_size(&block, &params);
         assert!(size_result.is_ok(), "Block size validation failed: {:?}", size_result);
+    }
+
+    #[test]
+    fn test_validate_merkle_root_single_transaction() {
+        // Create a block with a single coinbase transaction
+        let mut block = create_test_block(BlockHash::all_zeros(), 0, 0x1d00ffff);
+
+        // Calculate the correct merkle root for the single transaction
+        let correct_merkle_root = block.compute_merkle_root().unwrap_or_else(|| bitcoin::TxMerkleNode::all_zeros());
+        block.header.merkle_root = correct_merkle_root;
+
+        // Should pass validation
+        assert!(validate_merkle_root(&block).is_ok());
+    }
+
+    #[test]
+    fn test_validate_merkle_root_multiple_transactions() {
+        // Create a block with multiple transactions
+        let mut block = create_test_block(BlockHash::all_zeros(), 0, 0x1d00ffff);
+
+        // Add a second transaction
+        let second_tx = Transaction {
+            version: bitcoin::transaction::Version(1),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_str("0000000000000000000000000000000000000000000000000000000000000000").unwrap(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        block.txdata.push(second_tx);
+
+        // Calculate the correct merkle root for both transactions
+        let correct_merkle_root = block.compute_merkle_root().unwrap_or_else(|| bitcoin::TxMerkleNode::all_zeros());
+        block.header.merkle_root = correct_merkle_root;
+
+        // Should pass validation
+        assert!(validate_merkle_root(&block).is_ok());
+    }
+
+    #[test]
+    fn test_validate_merkle_root_invalid() {
+        // Create a block with a single transaction
+        let mut block = create_test_block(BlockHash::all_zeros(), 0, 0x1d00ffff);
+
+        // Set an incorrect merkle root (all zeros)
+        block.header.merkle_root = bitcoin::TxMerkleNode::all_zeros();
+
+        // Should fail validation
+        let result = validate_merkle_root(&block);
+        assert!(matches!(result, Err(ValidationError::InvalidMerkleRoot)));
+    }
+
+    #[test]
+    fn test_validate_merkle_root_empty_block() {
+        // Create an empty block (this should fail structure validation first)
+        let mut block = create_test_block(BlockHash::all_zeros(), 0, 0x1d00ffff);
+        block.txdata.clear();
+
+        // Should fail structure validation before merkle root validation
+        let result = validate_block_structure(&block);
+        assert!(matches!(result, Err(ValidationError::EmptyBlock)));
+    }
+
+    #[test]
+    fn test_merkle_root_integration_with_consensus_validation() {
+        let _params = ConsensusParams::mainnet();
+
+        // Create a block with correct merkle root
+        let mut block = create_test_block(BlockHash::all_zeros(), 0, 0x1d00ffff);
+        let correct_merkle_root = block.compute_merkle_root().unwrap_or_else(|| bitcoin::TxMerkleNode::all_zeros());
+        block.header.merkle_root = correct_merkle_root;
+
+        // Test structure and merkle root validation (skip PoW)
+        let structure_result = validate_block_structure(&block);
+        assert!(structure_result.is_ok());
+
+        let merkle_result = validate_merkle_root(&block);
+        assert!(merkle_result.is_ok());
+
+        // Test with invalid merkle root
+        block.header.merkle_root = bitcoin::TxMerkleNode::all_zeros();
+        let invalid_merkle_result = validate_merkle_root(&block);
+        assert!(matches!(invalid_merkle_result, Err(ValidationError::InvalidMerkleRoot)));
     }
 }
