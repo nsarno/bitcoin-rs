@@ -19,6 +19,14 @@ pub struct ConsensusParams {
     pub genesis_hash: BlockHash,
     /// Network name for debugging
     pub network_name: &'static str,
+    /// Maximum block size in bytes (legacy limit)
+    pub max_block_size: usize,
+    /// Maximum block weight in weight units (SegWit limit)
+    pub max_block_weight: usize,
+    /// Minimum transaction weight in weight units
+    pub min_transaction_weight: usize,
+    /// Number of blocks before coinbase outputs can be spent
+    pub coinbase_maturity: u32,
 }
 
 impl ConsensusParams {
@@ -32,6 +40,10 @@ impl ConsensusParams {
             genesis_hash: BlockHash::from_str("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
                 .expect("Valid mainnet genesis hash"),
             network_name: "mainnet",
+            max_block_size: 1_000_000,        // 1MB legacy limit
+            max_block_weight: 4_000_000,      // 4MW SegWit limit
+            min_transaction_weight: 400,      // minimum valid transaction weight
+            coinbase_maturity: 100,           // 100 blocks before coinbase can be spent
         }
     }
 
@@ -45,6 +57,10 @@ impl ConsensusParams {
             genesis_hash: BlockHash::from_str("000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943")
                 .expect("Valid testnet genesis hash"),
             network_name: "testnet",
+            max_block_size: 1_000_000,        // 1MB legacy limit
+            max_block_weight: 4_000_000,      // 4MW SegWit limit
+            min_transaction_weight: 400,      // minimum valid transaction weight
+            coinbase_maturity: 100,           // 100 blocks before coinbase can be spent
         }
     }
 
