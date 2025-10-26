@@ -60,6 +60,7 @@ impl BlockDatabase {
             "height_index",
             "prev_hash_index",
             "metadata",
+            "utxos",
         ];
 
         let db = DB::open_cf(&opts, path, &column_families)?;
@@ -248,6 +249,11 @@ impl BlockDatabase {
         }
 
         Ok(stats)
+    }
+
+    /// Get the underlying RocksDB instance for advanced operations
+    pub fn db(&self) -> &DB {
+        &self.db
     }
 }
 

@@ -6,12 +6,15 @@ use bitcoin::block::Header;
 use crate::storage::{BlockDatabase, DatabaseError};
 use crate::blockchain::block_index::{BlockIndex, BlockIndexError, BlockIndexEntry};
 use crate::blockchain::validation::{ValidationError, validate_block_consensus_with_difficulty, validate_header_pow};
+use crate::blockchain::utxo::{UtxoSet, UtxoError, UtxoStats};
 use crate::consensus::ConsensusParams;
 use std::path::Path;
+use std::sync::Arc;
 use thiserror::Error;
 
 pub mod block_index;
 pub mod validation;
+pub mod utxo;
 
 #[derive(Error, Debug)]
 pub enum BlockchainError {
@@ -25,11 +28,14 @@ pub enum BlockchainError {
     InvalidBlock,
     #[error("Validation error: {0}")]
     Validation(#[from] ValidationError),
+    #[error("UTXO error: {0}")]
+    Utxo(#[from] UtxoError),
 }
 
 /// High-level blockchain interface combining database and index
 pub struct Blockchain {
     index: BlockIndex,
+    utxo_set: UtxoSet,
     consensus_params: ConsensusParams,
 }
 
@@ -41,11 +47,13 @@ impl Blockchain {
 
     /// Create a new blockchain instance with specific consensus parameters
     pub fn new_with_consensus<P: AsRef<Path>>(data_dir: P, consensus_params: ConsensusParams) -> Result<Self, BlockchainError> {
-        let db = BlockDatabase::open(data_dir)?;
+        let db = Arc::new(BlockDatabase::open(data_dir)?);
+        let utxo_set = UtxoSet::new(db.clone());
         let index = BlockIndex::new(db)?;
 
         Ok(Blockchain {
             index,
+            utxo_set,
             consensus_params,
         })
     }
@@ -62,6 +70,10 @@ impl Blockchain {
         // Now validate block according to all consensus rules including difficulty
         validate_block_consensus_with_difficulty(block, &self.index, &self.consensus_params)?;
 
+        // Update UTXO set with the new block
+        let height = self.index.get_best_height();
+        self.utxo_set.apply_block(block, height)?;
+
         Ok(())
     }
 
@@ -73,6 +85,10 @@ impl Blockchain {
 
         // Add the header to the index
         self.index.add_block(block.header)?;
+
+        // Update UTXO set with the new block
+        let height = self.index.get_best_height();
+        self.utxo_set.apply_block(block, height)?;
 
         Ok(())
     }
@@ -175,6 +191,21 @@ impl Blockchain {
     /// Get the consensus parameters for this blockchain
     pub fn consensus_params(&self) -> &ConsensusParams {
         &self.consensus_params
+    }
+
+    /// Get a UTXO by its outpoint
+    pub fn get_utxo(&self, outpoint: &bitcoin::OutPoint) -> Result<Option<crate::blockchain::utxo::UtxoEntry>, BlockchainError> {
+        self.utxo_set.get_utxo(outpoint).map_err(Into::into)
+    }
+
+    /// Check if a UTXO exists
+    pub fn has_utxo(&self, outpoint: &bitcoin::OutPoint) -> Result<bool, BlockchainError> {
+        self.utxo_set.has_utxo(outpoint).map_err(Into::into)
+    }
+
+    /// Get UTXO set statistics
+    pub fn get_utxo_stats(&self) -> Result<UtxoStats, BlockchainError> {
+        self.utxo_set.get_stats().map_err(Into::into)
     }
 }
 

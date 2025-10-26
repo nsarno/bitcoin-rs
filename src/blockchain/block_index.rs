@@ -5,6 +5,7 @@ use bitcoin::BlockHash;
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use crate::storage::{BlockDatabase, DatabaseError};
+use std::sync::Arc;
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -57,7 +58,7 @@ impl BlockIndexEntry {
 
 /// Block index for efficient block lookups and chain management
 pub struct BlockIndex {
-    db: BlockDatabase,
+    db: Arc<BlockDatabase>,
     // In-memory index: hash -> entry
     blocks: HashMap<BlockHash, BlockIndexEntry>,
     // Height to hash mapping for quick lookups
@@ -70,7 +71,7 @@ pub struct BlockIndex {
 
 impl BlockIndex {
     /// Create a new block index from the database
-    pub fn new(db: BlockDatabase) -> Result<Self, BlockIndexError> {
+    pub fn new(db: Arc<BlockDatabase>) -> Result<Self, BlockIndexError> {
         let mut index = BlockIndex {
             db,
             blocks: HashMap::new(),
@@ -371,7 +372,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test_db");
 
-        let db = BlockDatabase::open(&db_path).expect("Failed to create database");
+        let db = Arc::new(BlockDatabase::open(&db_path).expect("Failed to create database"));
         let index = BlockIndex::new(db).expect("Failed to create block index");
 
         assert_eq!(index.get_best_height(), 0);
@@ -383,7 +384,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test_db");
 
-        let db = BlockDatabase::open(&db_path).expect("Failed to create database");
+        let db = Arc::new(BlockDatabase::open(&db_path).expect("Failed to create database"));
         let mut index = BlockIndex::new(db).expect("Failed to create block index");
 
         let header = create_test_header(BlockHash::all_zeros(), 0);
@@ -408,7 +409,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test_db");
 
-        let db = BlockDatabase::open(&db_path).expect("Failed to create database");
+        let db = Arc::new(BlockDatabase::open(&db_path).expect("Failed to create database"));
         let mut index = BlockIndex::new(db).expect("Failed to create block index");
 
         // Add genesis block
@@ -447,7 +448,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test_db");
 
-        let db = BlockDatabase::open(&db_path).expect("Failed to create database");
+        let db = Arc::new(BlockDatabase::open(&db_path).expect("Failed to create database"));
         let mut index = BlockIndex::new(db).expect("Failed to create block index");
 
         // Add a parent block first
@@ -471,7 +472,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test_db");
 
-        let db = BlockDatabase::open(&db_path).expect("Failed to create database");
+        let db = Arc::new(BlockDatabase::open(&db_path).expect("Failed to create database"));
         let mut index = BlockIndex::new(db).expect("Failed to create block index");
 
         // Add a few blocks
@@ -499,7 +500,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test_db");
 
-        let db = BlockDatabase::open(&db_path).expect("Failed to create database");
+        let db = Arc::new(BlockDatabase::open(&db_path).expect("Failed to create database"));
         let mut index = BlockIndex::new(db).expect("Failed to create block index");
 
         // Create a chain of 5 blocks
@@ -531,7 +532,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test_db");
 
-        let db = BlockDatabase::open(&db_path).expect("Failed to create database");
+        let db = Arc::new(BlockDatabase::open(&db_path).expect("Failed to create database"));
         let mut index = BlockIndex::new(db).expect("Failed to create block index");
 
         let header = create_test_header(BlockHash::all_zeros(), 0);
@@ -551,7 +552,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test_db");
 
-        let db = BlockDatabase::open(&db_path).expect("Failed to create database");
+        let db = Arc::new(BlockDatabase::open(&db_path).expect("Failed to create database"));
         let mut index = BlockIndex::new(db).expect("Failed to create block index");
 
         // Add some blocks

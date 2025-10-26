@@ -104,18 +104,18 @@ bitcoin-rs/
    - Merkle root validation
    - Difficulty adjustment validation
 
-2. **Transaction validation**
+2. **UTXO set management**
+
+   - Build and maintain UTXO database
+   - Handle spending and creation of outputs
+   - Implement efficient UTXO lookups
+
+3. **Transaction validation**
 
    - Input/output validation
    - Script execution (using `bitcoin` crate)
    - Signature verification (ECDSA, Schnorr)
    - Timelock validation (nLockTime, nSequence)
-
-3. **UTXO set management**
-
-   - Build and maintain UTXO database
-   - Handle spending and creation of outputs
-   - Implement efficient UTXO lookups
 
 ### Phase 4: Mempool & Transaction Relay
 

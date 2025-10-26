@@ -65,7 +65,7 @@ async fn test_network_service_start() {
 
             // The service should have attempted to connect to peers
             // Note: Actual connections might fail in test environments
-            assert!(network_service.total_peer_count() >= 0);
+            assert!(network_service.total_peer_count() >= 1);
         }
         Ok(Err(e)) => {
             // This might fail in environments without internet access

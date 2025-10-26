@@ -1,12 +1,13 @@
 // Block validation logic
 // This module implements proof-of-work verification and other block validation rules
 
-use bitcoin::{Block, Target, CompactTarget, Transaction, BlockHash};
+use bitcoin::{Block, Target, CompactTarget, Transaction, BlockHash, OutPoint};
 use bitcoin::block::Header;
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
 use crate::consensus::ConsensusParams;
 use crate::blockchain::block_index::BlockIndex;
+use crate::blockchain::utxo::UtxoSet;
 use thiserror::Error;
 use std::collections::HashSet;
 
@@ -36,6 +37,14 @@ pub enum ValidationError {
     InvalidMerkleRoot,
     #[error("Invalid difficulty adjustment: {0}")]
     InvalidDifficulty(String),
+    #[error("Missing input: {0}")]
+    MissingInput(OutPoint),
+    #[error("Double spend: {0}")]
+    DoubleSpend(OutPoint),
+    #[error("Immature coinbase output")]
+    ImmatureCoinbase,
+    #[error("Insufficient input value: expected {expected}, got {actual}")]
+    InsufficientInputValue { expected: u64, actual: u64 },
 }
 
 /// Verify that a block's proof-of-work meets the required target
@@ -1034,4 +1043,59 @@ mod tests {
         let new_target = result.unwrap();
         assert_eq!(new_target, params.pow_limit_target());
     }
+}
+
+/// Validate transaction inputs against the UTXO set
+/// Returns the total input value for fee calculation
+pub fn validate_transaction_inputs(
+    tx: &Transaction,
+    utxo_set: &UtxoSet,
+    height: u32,
+    params: &ConsensusParams,
+) -> Result<u64, ValidationError> {
+    // Skip validation for coinbase transactions
+    if tx.is_coinbase() {
+        return Ok(0);
+    }
+
+    let mut total_input_value = 0u64;
+    let mut seen_inputs = HashSet::new();
+
+    // Validate each input
+    for input in &tx.input {
+        let outpoint = &input.previous_output;
+
+        // Check for duplicate inputs within the same transaction
+        if !seen_inputs.insert(outpoint) {
+            return Err(ValidationError::DoubleSpend(*outpoint));
+        }
+
+        // Get the UTXO for this input
+        let utxo = utxo_set.get_utxo(outpoint)
+            .map_err(|_| ValidationError::MissingInput(*outpoint))?
+            .ok_or(ValidationError::MissingInput(*outpoint))?;
+
+        // Check coinbase maturity
+        if !utxo.is_mature(height, params.coinbase_maturity) {
+            return Err(ValidationError::ImmatureCoinbase);
+        }
+
+        // Add to total input value
+        total_input_value += utxo.value.to_sat();
+    }
+
+    // Calculate total output value
+    let total_output_value: u64 = tx.output.iter()
+        .map(|output| output.value.to_sat())
+        .sum();
+
+    // Check that inputs cover outputs (allowing for fees)
+    if total_input_value < total_output_value {
+        return Err(ValidationError::InsufficientInputValue {
+            expected: total_output_value,
+            actual: total_input_value,
+        });
+    }
+
+    Ok(total_input_value)
 }
