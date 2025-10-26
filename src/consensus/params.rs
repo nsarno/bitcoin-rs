@@ -78,6 +78,17 @@ impl ConsensusParams {
     pub fn expected_timespan(&self) -> u32 {
         self.difficulty_adjustment_interval * self.pow_target_spacing
     }
+
+    /// Check if minimum difficulty blocks are allowed (testnet rule)
+    /// On testnet, if a block takes more than 20 minutes, minimum difficulty is allowed
+    pub fn allow_min_difficulty_blocks(&self) -> bool {
+        self.network_name == "testnet"
+    }
+
+    /// Get the minimum difficulty target (maximum allowed target)
+    pub fn min_difficulty_target(&self) -> Target {
+        self.pow_limit_target()
+    }
 }
 
 #[cfg(test)]
@@ -132,5 +143,27 @@ mod tests {
 
         // Should be 2016 blocks * 10 minutes = 20,160 minutes = 1,209,600 seconds
         assert_eq!(expected, 2016 * 10 * 60);
+    }
+
+    #[test]
+    fn test_allow_min_difficulty_blocks() {
+        let mainnet_params = ConsensusParams::mainnet();
+        let testnet_params = ConsensusParams::testnet();
+
+        // Mainnet should not allow minimum difficulty blocks
+        assert!(!mainnet_params.allow_min_difficulty_blocks());
+
+        // Testnet should allow minimum difficulty blocks
+        assert!(testnet_params.allow_min_difficulty_blocks());
+    }
+
+    #[test]
+    fn test_min_difficulty_target() {
+        let params = ConsensusParams::mainnet();
+        let min_target = params.min_difficulty_target();
+        let pow_limit = params.pow_limit_target();
+
+        // Minimum difficulty target should equal the PoW limit
+        assert_eq!(min_target, pow_limit);
     }
 }

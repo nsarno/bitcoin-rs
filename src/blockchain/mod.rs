@@ -5,7 +5,7 @@ use bitcoin::{Block, BlockHash};
 use bitcoin::block::Header;
 use crate::storage::{BlockDatabase, DatabaseError};
 use crate::blockchain::block_index::{BlockIndex, BlockIndexError, BlockIndexEntry};
-use crate::blockchain::validation::{ValidationError, validate_block_consensus, validate_header_pow};
+use crate::blockchain::validation::{ValidationError, validate_block_consensus_with_difficulty, validate_header_pow};
 use crate::consensus::ConsensusParams;
 use std::path::Path;
 use thiserror::Error;
@@ -52,14 +52,15 @@ impl Blockchain {
 
     /// Add a new block to the blockchain
     pub fn add_block(&mut self, block: &Block) -> Result<(), BlockchainError> {
-        // Validate block according to all consensus rules
-        validate_block_consensus(block, &self.consensus_params)?;
-
+        // First add the block to the index so we can validate difficulty
         // Store the full block in the database
         self.index.database().store_block(block)?;
 
         // Add the header to the index
         self.index.add_block(block.header)?;
+
+        // Now validate block according to all consensus rules including difficulty
+        validate_block_consensus_with_difficulty(block, &self.index, &self.consensus_params)?;
 
         Ok(())
     }

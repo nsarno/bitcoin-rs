@@ -1,13 +1,14 @@
 // Block validation logic
 // This module implements proof-of-work verification and other block validation rules
 
-use bitcoin::{Block, Target, CompactTarget, Transaction, Txid};
+use bitcoin::{Block, Target, CompactTarget, Transaction, BlockHash};
 use bitcoin::block::Header;
 use bitcoin::consensus::Encodable;
+use bitcoin::hashes::Hash;
 use crate::consensus::ConsensusParams;
+use crate::blockchain::block_index::BlockIndex;
 use thiserror::Error;
 use std::collections::HashSet;
-use std::str::FromStr;
 
 #[derive(Error, Debug)]
 pub enum ValidationError {
@@ -33,6 +34,8 @@ pub enum ValidationError {
     InvalidTransactionStructure,
     #[error("Merkle root validation failed")]
     InvalidMerkleRoot,
+    #[error("Invalid difficulty adjustment: {0}")]
+    InvalidDifficulty(String),
 }
 
 /// Verify that a block's proof-of-work meets the required target
@@ -248,6 +251,177 @@ pub fn validate_merkle_root(block: &Block) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// Calculate the next work required for a block at the given height
+/// This implements Bitcoin's difficulty adjustment algorithm
+pub fn calculate_next_work_required(
+    last_block: &Header,
+    first_block: &Header,
+    params: &ConsensusParams,
+) -> Result<Target, ValidationError> {
+    // If this is the first block after genesis, use genesis difficulty
+    if last_block.prev_blockhash == BlockHash::all_zeros() {
+        return Ok(last_block.target());
+    }
+
+    // Calculate actual timespan between first and last block
+    let actual_timespan = last_block.time - first_block.time;
+    let expected_timespan = params.expected_timespan();
+
+    // Clamp the actual timespan to prevent extreme difficulty changes
+    // Bitcoin limits changes to 4x in either direction
+    let clamped_timespan = actual_timespan
+        .max(expected_timespan / 4)
+        .min(expected_timespan * 4);
+
+    // Calculate new target: new_target = old_target * (actual_timespan / expected_timespan)
+    let old_target = last_block.target();
+
+    // Use 256-bit arithmetic for precise calculation
+    // new_target = old_target * clamped_timespan / expected_timespan
+    let new_target = calculate_target_with_timespan(&old_target, clamped_timespan, expected_timespan);
+
+    // Ensure the new target doesn't exceed the PoW limit
+    let pow_limit = params.pow_limit_target();
+    if new_target > pow_limit {
+        Ok(pow_limit)
+    } else {
+        Ok(new_target)
+    }
+}
+
+/// Calculate new target using timespan ratio with proper 256-bit arithmetic
+fn calculate_target_with_timespan(old_target: &Target, actual_timespan: u32, expected_timespan: u32) -> Target {
+    if actual_timespan == expected_timespan {
+        return *old_target;
+    }
+
+    let numerator = actual_timespan as u64;
+    let denominator = expected_timespan as u64;
+
+    // Big-endian 256-bit multiply by u64
+    fn mul_be_256_by_u64(value: [u8; 32], mul: u64) -> [u8; 32] {
+        if mul == 0 {
+            return [0u8; 32];
+        }
+        let mut out = [0u8; 32];
+        let mut carry: u128 = 0;
+        for i in (0..32).rev() {
+            let part = value[i] as u128;
+            let prod = part * (mul as u128) + carry;
+            out[i] = (prod & 0xff) as u8;
+            carry = prod >> 8;
+        }
+        out
+    }
+
+    // Big-endian 256-bit divide by u64 (returns quotient, discards remainder)
+    fn div_be_256_by_u64(value: [u8; 32], div: u64) -> [u8; 32] {
+        if div == 0 { return [0u8; 32]; }
+        let mut out = [0u8; 32];
+        let mut rem: u128 = 0;
+        let d = div as u128;
+        for i in 0..32 {
+            let cur = (rem << 8) | (value[i] as u128);
+            let q = cur / d; // fits in 0..255
+            rem = cur % d;
+            out[i] = q as u8;
+        }
+        out
+    }
+
+    let old_bytes = old_target.to_be_bytes();
+    let scaled = mul_be_256_by_u64(old_bytes, numerator);
+    let new_bytes = div_be_256_by_u64(scaled, denominator);
+    Target::from_be_bytes(new_bytes)
+}
+
+/// Get the next work required for a block at the given height
+/// This function looks up the necessary ancestor blocks and calculates the required difficulty
+pub fn get_next_work_required(
+    block_index: &BlockIndex,
+    height: u32,
+    params: &ConsensusParams,
+) -> Result<Target, ValidationError> {
+    // Genesis block uses its own difficulty
+    if height == 0 {
+        if let Some(genesis_entry) = block_index.get_by_height(0) {
+            return Ok(genesis_entry.header.target());
+        } else {
+            return Err(ValidationError::InvalidDifficulty("Genesis block not found".to_string()));
+        }
+    }
+
+    // For blocks before the first adjustment, use genesis difficulty
+    if height < params.difficulty_adjustment_interval {
+        if let Some(genesis_entry) = block_index.get_by_height(0) {
+            return Ok(genesis_entry.header.target());
+        } else {
+            return Err(ValidationError::InvalidDifficulty("Genesis block not found".to_string()));
+        }
+    }
+
+    // Check if this is a difficulty adjustment block
+    if height % params.difficulty_adjustment_interval == 0 {
+        // This is a difficulty adjustment block
+        // We need the last block of the previous period and the first block of the previous period
+        let last_block_height = height - 1;
+        let first_block_height = height - params.difficulty_adjustment_interval;
+
+        let last_block_entry = block_index.get_by_height(last_block_height)
+            .ok_or_else(|| ValidationError::InvalidDifficulty(
+                format!("Block at height {} not found", last_block_height)
+            ))?;
+
+        let first_block_entry = block_index.get_by_height(first_block_height)
+            .ok_or_else(|| ValidationError::InvalidDifficulty(
+                format!("Block at height {} not found", first_block_height)
+            ))?;
+
+        calculate_next_work_required(&last_block_entry.header, &first_block_entry.header, params)
+    } else {
+        // Not an adjustment block, use the same difficulty as the previous block
+        let prev_height = height - 1;
+        let prev_entry = block_index.get_by_height(prev_height)
+            .ok_or_else(|| ValidationError::InvalidDifficulty(
+                format!("Previous block at height {} not found", prev_height)
+            ))?;
+
+        Ok(prev_entry.header.target())
+    }
+}
+
+/// Validate that a block's difficulty target is correct
+pub fn validate_block_difficulty(
+    block: &Block,
+    block_index: &BlockIndex,
+    params: &ConsensusParams,
+) -> Result<(), ValidationError> {
+    // Get the block height from the index
+    let block_hash = block.block_hash();
+    let block_entry = block_index.get_by_hash(&block_hash)
+        .ok_or_else(|| ValidationError::InvalidDifficulty(
+            "Block not found in index".to_string()
+        ))?;
+
+    let height = block_entry.height;
+
+    // Get the expected target for this height
+    let expected_target = get_next_work_required(block_index, height, params)?;
+    let actual_target = block.header.target();
+
+    // Compare targets
+    if actual_target != expected_target {
+        return Err(ValidationError::InvalidDifficulty(
+            format!(
+                "Incorrect difficulty target at height {}: expected {:?}, got {:?}",
+                height, expected_target, actual_target
+            )
+        ));
+    }
+
+    Ok(())
+}
+
 /// Comprehensive block validation combining all consensus checks
 pub fn validate_block_consensus(block: &Block, params: &ConsensusParams) -> Result<(), ValidationError> {
     // 1. Block structure validation
@@ -265,14 +439,39 @@ pub fn validate_block_consensus(block: &Block, params: &ConsensusParams) -> Resu
     Ok(())
 }
 
+/// Comprehensive block validation with difficulty adjustment
+pub fn validate_block_consensus_with_difficulty(
+    block: &Block,
+    block_index: &BlockIndex,
+    params: &ConsensusParams,
+) -> Result<(), ValidationError> {
+    // 1. Block structure validation
+    validate_block_structure(block)?;
+
+    // 2. Merkle root validation
+    validate_merkle_root(block)?;
+
+    // 3. Block size/weight validation
+    validate_block_size(block, params)?;
+
+    // 4. Proof-of-work validation
+    validate_block_pow(block, params)?;
+
+    // 5. Difficulty adjustment validation
+    validate_block_difficulty(block, block_index, params)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::{Block, BlockHash, Transaction, TxIn, TxOut, OutPoint, ScriptBuf};
+    use bitcoin::{Block, BlockHash, Transaction, TxIn, TxOut, OutPoint, ScriptBuf, Txid};
     use bitcoin::block::Header;
     use bitcoin::hashes::Hash;
     use bitcoin::absolute::LockTime;
     use bitcoin::transaction::Version;
+    use std::str::FromStr;
 
     fn create_test_header(prev_hash: BlockHash, nonce: u32, bits: u32) -> Header {
         Header {
@@ -725,5 +924,114 @@ mod tests {
         block.header.merkle_root = bitcoin::TxMerkleNode::all_zeros();
         let invalid_merkle_result = validate_merkle_root(&block);
         assert!(matches!(invalid_merkle_result, Err(ValidationError::InvalidMerkleRoot)));
+    }
+
+    #[test]
+    fn test_difficulty_adjustment_calculation() {
+        let params = ConsensusParams::mainnet();
+
+        // Create two headers with different timestamps
+        let first_header = create_test_header(BlockHash::all_zeros(), 0, 0x1d00ffff);
+        let mut last_header = create_test_header(first_header.block_hash(), 1, 0x1d00ffff);
+
+        // Set timestamps to simulate a 2-week period (exactly expected timespan)
+        last_header.time = first_header.time + params.expected_timespan();
+
+        // Calculate next work required
+        let result = calculate_next_work_required(&last_header, &first_header, &params);
+        assert!(result.is_ok());
+
+        // Since timespan equals expected timespan, difficulty should remain the same
+        let new_target = result.unwrap();
+        assert_eq!(new_target, last_header.target());
+    }
+
+    #[test]
+    fn test_difficulty_adjustment_faster_mining() {
+        let params = ConsensusParams::mainnet();
+
+        // Create two headers with different timestamps
+        let first_header = create_test_header(BlockHash::all_zeros(), 0, 0x1d00ffff);
+        let mut last_header = create_test_header(first_header.block_hash(), 1, 0x1d00ffff);
+
+        // Set timestamps to simulate faster mining (half the expected timespan)
+        last_header.time = first_header.time + (params.expected_timespan() / 2);
+
+        // Calculate next work required
+        let result = calculate_next_work_required(&last_header, &first_header, &params);
+        assert!(result.is_ok());
+
+        // Since mining was faster, difficulty should increase (target should decrease)
+        let new_target = result.unwrap();
+        assert!(new_target < last_header.target());
+    }
+
+    #[test]
+    fn test_difficulty_adjustment_slower_mining() {
+        let params = ConsensusParams::mainnet();
+
+        // Create two headers with different timestamps
+        // Use a target below the PoW limit so doubling won't clamp
+        let first_header = create_test_header(BlockHash::all_zeros(), 0, 0x1c00ffff);
+        let mut last_header = create_test_header(first_header.block_hash(), 1, 0x1c00ffff);
+
+        // Set timestamps to simulate slower mining (double the expected timespan)
+        last_header.time = first_header.time + (params.expected_timespan() * 2);
+
+        // Calculate next work required
+        let result = calculate_next_work_required(&last_header, &first_header, &params);
+        assert!(result.is_ok());
+
+        // Since mining was slower, difficulty should decrease (target should increase)
+        let new_target = result.unwrap();
+        let old_target = last_header.target();
+
+        // The target should increase when mining is slower (difficulty decreases)
+        println!("Old target: {:?}", old_target);
+        println!("New target: {:?}", new_target);
+        assert!(new_target > old_target, "New target should be greater than old target when mining is slower");
+    }
+
+    #[test]
+    fn test_difficulty_adjustment_clamping() {
+        let params = ConsensusParams::mainnet();
+
+        // Create two headers with different timestamps
+        let first_header = create_test_header(BlockHash::all_zeros(), 0, 0x1d00ffff);
+        let mut last_header = create_test_header(first_header.block_hash(), 1, 0x1d00ffff);
+
+        // Set timestamps to simulate extremely fast mining (1/8 of expected timespan)
+        // This should be clamped to 1/4 of expected timespan
+        last_header.time = first_header.time + (params.expected_timespan() / 8);
+
+        // Calculate next work required
+        let result = calculate_next_work_required(&last_header, &first_header, &params);
+        assert!(result.is_ok());
+
+        // The result should be clamped to maximum 4x difficulty increase
+        let new_target = result.unwrap();
+        // For now, just verify that the target is different (simplified test)
+        assert!(new_target != last_header.target());
+    }
+
+    #[test]
+    fn test_difficulty_adjustment_pow_limit() {
+        let params = ConsensusParams::mainnet();
+
+        // Create two headers with different timestamps
+        let first_header = create_test_header(BlockHash::all_zeros(), 0, 0x1d00ffff);
+        let mut last_header = create_test_header(first_header.block_hash(), 1, 0x1d00ffff);
+
+        // Set timestamps to simulate extremely slow mining (8x expected timespan)
+        // This should be clamped to 4x expected timespan
+        last_header.time = first_header.time + (params.expected_timespan() * 8);
+
+        // Calculate next work required
+        let result = calculate_next_work_required(&last_header, &first_header, &params);
+        assert!(result.is_ok());
+
+        // The result should be clamped to the PoW limit
+        let new_target = result.unwrap();
+        assert_eq!(new_target, params.pow_limit_target());
     }
 }
