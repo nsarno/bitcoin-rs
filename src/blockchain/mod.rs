@@ -5,7 +5,7 @@ use bitcoin::{Block, BlockHash};
 use bitcoin::block::Header;
 use crate::storage::{BlockDatabase, DatabaseError};
 use crate::blockchain::block_index::{BlockIndex, BlockIndexError, BlockIndexEntry};
-use crate::blockchain::validation::{ValidationError, validate_block_consensus_with_difficulty, validate_header_pow};
+use crate::blockchain::validation::{ValidationError, validate_block_consensus_with_difficulty, validate_header_pow, validate_transaction_consensus};
 use crate::blockchain::utxo::{UtxoSet, UtxoError, UtxoStats};
 use crate::consensus::ConsensusParams;
 use std::path::Path;
@@ -70,8 +70,20 @@ impl Blockchain {
         // Now validate block according to all consensus rules including difficulty
         validate_block_consensus_with_difficulty(block, &self.index, &self.consensus_params)?;
 
-        // Update UTXO set with the new block
+        // Validate all transactions against UTXO set and timelocks/scripts before applying
         let height = self.index.get_best_height();
+        let block_time = block.header.time;
+        for tx in &block.txdata {
+            validate_transaction_consensus(
+                tx,
+                &self.utxo_set,
+                height,
+                block_time,
+                &self.consensus_params,
+            )?;
+        }
+
+        // Update UTXO set with the new block
         self.utxo_set.apply_block(block, height)?;
 
         Ok(())

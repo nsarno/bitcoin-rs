@@ -10,6 +10,10 @@ license = "MIT"
 # Core Bitcoin dependencies
 bitcoin = "0.31"
 secp256k1 = { version = "0.28", features = ["rand", "recovery"] }
+# Consensus script verification (wrapper around Bitcoin Core's libbitcoinconsensus)
+# Marked optional to allow building without the native library present.
+# Use a published version; matches Bitcoin Core 26.0
+bitcoinconsensus = { version = "0.106.0+26.0", optional = true }
 
 # Async runtime and networking
 tokio = { version = "1.0", features = ["full"] }
@@ -34,6 +38,11 @@ chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
 rand = { version = "0.8", features = ["std"] }
 num-bigint = "0.4"
+
+[features]
+default = []
+# Enable to use libbitcoinconsensus for script verification
+consensus = ["bitcoinconsensus"]
 
 [dev-dependencies]
 tokio-test = "0.4"

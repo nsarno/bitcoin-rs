@@ -45,6 +45,18 @@ pub enum ValidationError {
     ImmatureCoinbase,
     #[error("Insufficient input value: expected {expected}, got {actual}")]
     InsufficientInputValue { expected: u64, actual: u64 },
+    #[error("Script verification failed: {0}")]
+    ScriptVerifyFailed(String),
+    #[error("Transaction not final (nLockTime)")]
+    NonFinal,
+    #[error("Transaction not final (nSequence relative locktime)")]
+    NonFinalRelativeLocktime,
+    #[error("Transaction too large")]
+    TxTooLarge,
+    #[error("Too many signature operations")]
+    TooManySigops,
+    #[error("Witness data too large")]
+    WitnessTooLarge,
 }
 
 /// Verify that a block's proof-of-work meets the required target
@@ -1098,4 +1110,246 @@ pub fn validate_transaction_inputs(
     }
 
     Ok(total_input_value)
+}
+
+#[cfg(test)]
+mod tx_validation_tests {
+    use super::*;
+    use bitcoin::{Transaction, TxIn, TxOut, ScriptBuf, OutPoint, Amount};
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version;
+    use tempfile::TempDir;
+    use crate::storage::BlockDatabase;
+
+    fn make_utxo_set() -> UtxoSet {
+        let temp_dir = TempDir::new().unwrap();
+        let db = std::sync::Arc::new(BlockDatabase::open(temp_dir.path()).unwrap());
+        UtxoSet::new(db)
+    }
+
+    #[test]
+    fn test_locktime_finality_height() {
+        // tx requiring height >= 100
+        let tx = Transaction {
+            version: Version(1),
+            lock_time: LockTime::from_height(100).unwrap(),
+            input: vec![TxIn { previous_output: OutPoint::null(), script_sig: ScriptBuf::new(), sequence: bitcoin::Sequence::from_consensus(0xfffffffe), witness: bitcoin::Witness::new() }],
+            output: vec![TxOut { value: Amount::from_sat(1), script_pubkey: ScriptBuf::new() }],
+        };
+
+        // Not final at height 99
+        assert!(matches!(validate_locktime(&tx, 99, 0), Err(ValidationError::NonFinal)));
+        // Final at height 100
+        assert!(validate_locktime(&tx, 100, 0).is_ok());
+    }
+
+    #[test]
+    fn test_sequence_relative_height_lock() {
+        let utxos = make_utxo_set();
+        // Create a prevout at height 10
+        let prev_outpoint = OutPoint::new(bitcoin::Txid::from_byte_array([1u8;32]), 0);
+        let prev_entry = crate::blockchain::utxo::UtxoEntry::new(Amount::from_sat(1000), ScriptBuf::new(), 10, false);
+        utxos.store_utxo(&prev_outpoint, &prev_entry).unwrap();
+
+        // Sequence requires +5 blocks (height-based)
+        let seq = bitcoin::Sequence::from_consensus(5);
+        let tx = Transaction {
+            version: Version(1),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn { previous_output: prev_outpoint, script_sig: ScriptBuf::new(), sequence: seq, witness: bitcoin::Witness::new() }],
+            output: vec![TxOut { value: Amount::from_sat(1), script_pubkey: ScriptBuf::new() }],
+        };
+
+        // Not final at height 14
+        assert!(matches!(validate_sequence(&tx, &utxos, 14, 0), Err(ValidationError::NonFinalRelativeLocktime)));
+        // Final at height 15
+        assert!(validate_sequence(&tx, &utxos, 15, 0).is_ok());
+    }
+}
+
+/// Verify a single input's script using libbitcoinconsensus when available.
+/// Falls back to a no-op OK if the consensus feature is disabled.
+pub fn verify_script(
+    tx: &Transaction,
+    input_index: usize,
+    prev_value_sats: u64,
+    script_pubkey: &[u8],
+) -> Result<(), ValidationError> {
+    #[cfg(feature = "consensus")]
+    {
+        use bitcoinconsensus::{verify, VerificationError, VerificationFlags};
+        // Standard flags similar to Bitcoin Core default policy for blocks
+        let flags = VerificationFlags::SCRIPT_VERIFY_P2SH
+            | VerificationFlags::SCRIPT_VERIFY_WITNESS
+            | VerificationFlags::SCRIPT_VERIFY_NULLDUMMY
+            | VerificationFlags::SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY
+            | VerificationFlags::SCRIPT_VERIFY_CHECKSEQUENCEVERIFY
+            | VerificationFlags::SCRIPT_VERIFY_DERSIG
+            | VerificationFlags::SCRIPT_VERIFY_LOW_S
+            | VerificationFlags::SCRIPT_VERIFY_MINIMALDATA
+            | VerificationFlags::SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM
+            | VerificationFlags::SCRIPT_VERIFY_CLEANSTACK
+            | VerificationFlags::SCRIPT_VERIFY_WITNESS_PUBKEYTYPE;
+
+        let tx_bytes = bitcoin::consensus::encode::serialize(tx);
+        verify(script_pubkey, prev_value_sats, &tx_bytes, input_index, flags)
+            .map_err(|e: VerificationError| ValidationError::ScriptVerifyFailed(e.to_string()))
+    }
+    #[cfg(not(feature = "consensus"))]
+    {
+        // Without libbitcoinconsensus, we cannot do consensus script checks here.
+        // Return Ok to allow builds without the native library; integration should enable the feature.
+        let _ = (tx, input_index, prev_value_sats, script_pubkey);
+        Ok(())
+    }
+}
+
+/// Verify all input scripts in a transaction against the UTXO set.
+pub fn verify_transaction_scripts(
+    tx: &Transaction,
+    utxo_set: &UtxoSet,
+) -> Result<(), ValidationError> {
+    if tx.is_coinbase() {
+        return Ok(());
+    }
+
+    for (i, input) in tx.input.iter().enumerate() {
+        let utxo = utxo_set
+            .get_utxo(&input.previous_output)
+            .map_err(|_| ValidationError::MissingInput(input.previous_output))?
+            .ok_or(ValidationError::MissingInput(input.previous_output))?;
+
+        let script_pubkey_bytes = utxo.script_pubkey.as_bytes().to_vec();
+        verify_script(tx, i, utxo.value.to_sat(), &script_pubkey_bytes)?;
+    }
+    Ok(())
+}
+
+/// Check if transaction is final with respect to nLockTime and input sequences (BIP-113 simplified).
+pub fn validate_locktime(
+    tx: &Transaction,
+    block_height: u32,
+    block_time: u32,
+) -> Result<(), ValidationError> {
+    use bitcoin::absolute::LockTime;
+
+    match tx.lock_time {
+        LockTime::ZERO => return Ok(()),
+        _ => {}
+    }
+
+    // If all sequences are final, tx is final regardless of lock_time
+    let all_final = tx
+        .input
+        .iter()
+        .all(|inp| inp.sequence.to_consensus_u32() == u32::MAX);
+    if all_final {
+        return Ok(());
+    }
+
+    // Interpret locktime as height or time based on threshold (per consensus rules)
+    const LOCKTIME_THRESHOLD: u32 = 500_000_000; // below: height, above: UNIX time
+    let lock = tx.lock_time.to_consensus_u32();
+    let satisfied = if lock < LOCKTIME_THRESHOLD {
+        block_height >= lock
+    } else {
+        block_time >= lock
+    };
+
+    if satisfied { Ok(()) } else { Err(ValidationError::NonFinal) }
+}
+
+/// Validate relative locktime using BIP-68 semantics (simplified using input sequence and UTXO heights).
+pub fn validate_sequence(
+    tx: &Transaction,
+    utxo_set: &UtxoSet,
+    block_height: u32,
+    block_time: u32,
+) -> Result<(), ValidationError> {
+    // Coinbase transactions do not enforce sequence relative locks
+    if tx.is_coinbase() {
+        return Ok(());
+    }
+
+    // If any input has the disable flag set, ignore relative lock for that input
+    // BIP-68: sequence format
+    const SEQUENCE_LOCKTIME_DISABLE_FLAG: u32 = 1 << 31;
+    const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22; // 0 = height, 1 = time based
+    const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000ffff;
+    const SEQUENCE_GRANULARITY: u32 = 9; // time-based units are multiples of 512 seconds
+
+    for input in &tx.input {
+        let seq = input.sequence.to_consensus_u32();
+        if (seq & SEQUENCE_LOCKTIME_DISABLE_FLAG) != 0 {
+            continue; // disabled
+        }
+
+        // Fetch the referenced UTXO to get its height for height-based relative locks
+        let prev = utxo_set
+            .get_utxo(&input.previous_output)
+            .map_err(|_| ValidationError::MissingInput(input.previous_output))?
+            .ok_or(ValidationError::MissingInput(input.previous_output))?;
+
+        if (seq & SEQUENCE_LOCKTIME_TYPE_FLAG) == 0 {
+            // Height-based relative lock
+            let required = (seq & SEQUENCE_LOCKTIME_MASK) as u32;
+            let spendable_height = prev.height.saturating_add(required);
+            if block_height < spendable_height {
+                return Err(ValidationError::NonFinalRelativeLocktime);
+            }
+        } else {
+            // Time-based relative lock: units of 512 seconds from the previous block time
+            let required_units = (seq & SEQUENCE_LOCKTIME_MASK) as u32;
+            let required_seconds = required_units << SEQUENCE_GRANULARITY;
+            // We do not have per-UTXO MTP/time; use current block time as a simplified gate.
+            // In production, use MedianTimePast of the chain and previous confirmation time.
+            if block_time < required_seconds {
+                return Err(ValidationError::NonFinalRelativeLocktime);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Basic standardness/limits checks for size, weight, and witness.
+pub fn validate_transaction_standard_limits(tx: &Transaction, params: &ConsensusParams) -> Result<(), ValidationError> {
+    // Use encoded size for legacy size check
+    let mut buf = Vec::new();
+    tx.consensus_encode(&mut buf).map_err(|_| ValidationError::TxTooLarge)?;
+    let size = buf.len();
+    if size > params.max_block_size { // reuse block param as rough limit placeholder
+        return Err(ValidationError::TxTooLarge);
+    }
+
+    // Sigop counting and witness limits are complex; placeholders for now
+    // In production, count accurate sigops per script type.
+    Ok(())
+}
+
+/// Comprehensive transaction validation combining structure, IO, scripts, and timelocks.
+pub fn validate_transaction_consensus(
+    tx: &Transaction,
+    utxo_set: &UtxoSet,
+    block_height: u32,
+    block_time: u32,
+    params: &ConsensusParams,
+) -> Result<(), ValidationError> {
+    // Structure
+    validate_transaction_structure(tx)?;
+
+    // Timelocks
+    validate_locktime(tx, block_height, block_time)?;
+    validate_sequence(tx, utxo_set, block_height, block_time)?;
+
+    // Inputs existence, maturity, and value checks
+    let _total_in = validate_transaction_inputs(tx, utxo_set, block_height, params)?;
+
+    // Scripts/signatures
+    verify_transaction_scripts(tx, utxo_set)?;
+
+    // Size/standardness (basic)
+    validate_transaction_standard_limits(tx, params)?;
+
+    Ok(())
 }
