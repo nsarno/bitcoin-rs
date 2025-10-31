@@ -44,6 +44,53 @@ impl MempoolEntry {
     pub fn txid(&self) -> Txid {
         self.tx.txid()
     }
+
+    /// Calculate fee rate (fee per byte)
+    ///
+    /// Returns the fee rate in satoshis per byte, or None if fee is not set or size is zero.
+    pub fn calculate_fee_rate(&self) -> Option<u64> {
+        match (self.fee, self.size) {
+            (Some(fee), size) if size > 0 => Some(fee.to_sat() / size as u64),
+            _ => None,
+        }
+    }
+}
+
+impl PartialEq for MempoolEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.txid() == other.txid()
+    }
+}
+
+impl Eq for MempoolEntry {}
+
+impl PartialOrd for MempoolEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MempoolEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Primary sort: fee rate (descending - higher fee rate = higher priority)
+        match (self.calculate_fee_rate(), other.calculate_fee_rate()) {
+            (Some(self_rate), Some(other_rate)) => {
+                match other_rate.cmp(&self_rate) {
+                    std::cmp::Ordering::Equal => {
+                        // Secondary sort: transaction ID for determinism
+                        self.txid().cmp(&other.txid())
+                    }
+                    ord => ord,
+                }
+            }
+            (Some(_), None) => std::cmp::Ordering::Less, // self has fee, other doesn't - self is higher priority
+            (None, Some(_)) => std::cmp::Ordering::Greater, // other has fee, self doesn't - other is higher priority
+            (None, None) => {
+                // Both have no fee - sort by transaction ID for determinism
+                self.txid().cmp(&other.txid())
+            }
+        }
+    }
 }
 
 /// Mempool for storing unconfirmed transactions
@@ -52,14 +99,26 @@ pub struct Mempool {
     transactions: HashMap<Txid, MempoolEntry>,
     /// Total size of all transactions in bytes
     total_size: usize,
+    /// Maximum mempool size in bytes (default: 300MB)
+    max_size: usize,
 }
 
 impl Mempool {
-    /// Create a new empty mempool
+    /// Create a new empty mempool with default size limit (300MB)
     pub fn new() -> Self {
         Self {
             transactions: HashMap::new(),
             total_size: 0,
+            max_size: 300 * 1024 * 1024, // 300MB default
+        }
+    }
+
+    /// Create a new mempool with a custom maximum size
+    pub fn with_max_size(max_size: usize) -> Self {
+        Self {
+            transactions: HashMap::new(),
+            total_size: 0,
+            max_size,
         }
     }
 
@@ -140,6 +199,121 @@ impl Mempool {
     pub fn clear(&mut self) {
         self.transactions.clear();
         self.total_size = 0;
+    }
+
+    /// Add a validated transaction to the mempool with its calculated fee
+    ///
+    /// This method is used when a transaction has already been validated and its fee calculated.
+    /// It will evict low-priority transactions if the mempool exceeds its size limit.
+    pub fn add_validated(&mut self, entry: MempoolEntry) -> Result<(), MempoolError> {
+        let txid = entry.txid();
+
+        // Check for duplicates
+        if self.transactions.contains_key(&txid) {
+            return Err(MempoolError::DuplicateTransaction(txid));
+        }
+
+        let entry_size = entry.size;
+
+        // Check if adding this transaction would exceed the limit
+        if self.total_size + entry_size > self.max_size {
+            // Try to evict low-priority transactions to make room
+            self.evict_low_priority(self.total_size + entry_size - self.max_size)?;
+        }
+
+        // If still too large, reject
+        if self.total_size + entry_size > self.max_size {
+            return Err(MempoolError::MempoolFull);
+        }
+
+        self.transactions.insert(txid, entry);
+        self.total_size += entry_size;
+
+        Ok(())
+    }
+
+    /// Get transactions sorted by priority (fee rate)
+    ///
+    /// Returns an iterator over transactions sorted by fee rate (highest first).
+    pub fn get_by_priority(&self) -> impl Iterator<Item = (&Txid, &MempoolEntry)> {
+        let mut entries: Vec<_> = self.transactions.iter().collect();
+        // Sort by reverse order (since Ord is implemented for descending fee rate)
+        entries.sort_by(|(_, a), (_, b)| b.cmp(a));
+        entries.into_iter()
+    }
+
+    /// Get the transaction with the highest fee rate
+    ///
+    /// Returns None if the mempool is empty.
+    pub fn get_highest_fee_rate(&self) -> Option<(&Txid, &MempoolEntry)> {
+        self.transactions.iter()
+            .max_by(|(_, a), (_, b)| b.cmp(a))
+    }
+
+    /// Evict low-priority transactions to make room
+    ///
+    /// Removes transactions with the lowest fee rates until at least `bytes_to_free` bytes
+    /// have been freed. If it's not possible to free enough space, returns an error.
+    pub fn evict_low_priority(&mut self, bytes_to_free: usize) -> Result<(), MempoolError> {
+        if bytes_to_free == 0 {
+            return Ok(());
+        }
+
+        // Collect all entries with their fee rates
+        let mut entries: Vec<(Txid, MempoolEntry, Option<u64>)> = self.transactions
+            .drain()
+            .map(|(txid, entry)| {
+                let fee_rate = entry.calculate_fee_rate();
+                (txid, entry, fee_rate)
+            })
+            .collect();
+
+        // Sort by fee rate (lowest first for eviction)
+        entries.sort_by(|a, b| {
+            match (a.2, b.2) {
+                (Some(a_rate), Some(b_rate)) => a_rate.cmp(&b_rate),
+                (Some(_), None) => std::cmp::Ordering::Less, // a has fee, b doesn't - a is higher priority
+                (None, Some(_)) => std::cmp::Ordering::Greater, // b has fee, a doesn't - b is higher priority
+                (None, None) => a.0.cmp(&b.0), // Both have no fee - sort by txid for determinism
+            }
+        });
+
+        // Evict low-priority transactions until we've freed enough space
+        let mut freed = 0;
+        let mut to_keep = Vec::new();
+
+        for (txid, entry, _) in entries.into_iter().rev() {
+            if freed >= bytes_to_free {
+                // We've freed enough space, keep this one
+                to_keep.push((txid, entry));
+            } else {
+                // Evict this transaction
+                freed += entry.size;
+            }
+        }
+
+        // Check if we freed enough space
+        if freed < bytes_to_free {
+            // Not enough space could be freed - restore what we can
+            for (txid, entry) in to_keep {
+                let entry_size = entry.size;
+                self.transactions.insert(txid, entry);
+                self.total_size += entry_size;
+            }
+            return Err(MempoolError::MempoolFull);
+        }
+
+        // Restore the transactions we're keeping
+        for (txid, entry) in to_keep {
+            let entry_size = entry.size;
+            self.transactions.insert(txid, entry);
+            self.total_size += entry_size;
+        }
+
+        // Update total size (subtract what we freed)
+        self.total_size -= freed;
+
+        Ok(())
     }
 }
 
