@@ -222,7 +222,20 @@ impl PeerConnection {
             Ok(response)
         } else {
             // Handshake complete, handle other messages
-            Ok(None)
+
+            // Transaction-related messages (inv, getdata, tx) are handled by relay service
+            // They pass through here and will be processed by the relay service
+            match &message {
+                Message::Inv(_) | Message::GetData(_) | Message::Tx(_) => {
+                    // Transaction messages require relay service processing
+                    // Return None to indicate this message needs further handling
+                    Ok(None)
+                }
+                _ => {
+                    // Other messages (like headers, block) may be handled elsewhere
+                    Ok(None)
+                }
+            }
         }
     }
 
@@ -300,6 +313,11 @@ impl PeerConnection {
         self.tcp_stream = None;
         self.last_activity = SystemTime::now();
         Ok(())
+    }
+
+    /// Check if this is a transaction-related message that needs relay service handling
+    pub fn is_transaction_message(&self, message: &Message) -> bool {
+        matches!(message, Message::Inv(_) | Message::GetData(_) | Message::Tx(_))
     }
 
     /// Update connection quality metrics

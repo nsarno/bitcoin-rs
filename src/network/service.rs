@@ -4,7 +4,8 @@
 use crate::config::Config;
 use crate::network::{
     PeerManager, PeerManagerError, DnsSeedResolver, DnsSeedError,
-    message::NetworkAddress,
+    message::{NetworkAddress, Message, InvMessage, GetDataMessage, TxMessage},
+    relay_service::{TransactionRelayService, RelayAction, RelayServiceError},
 };
 use std::time::Duration;
 use tokio::time::{interval, sleep};
@@ -21,6 +22,8 @@ pub enum NetworkServiceError {
     Io(#[from] std::io::Error),
     #[error("Network service error: {0}")]
     Service(String),
+    #[error("Relay service error: {0}")]
+    RelayService(#[from] RelayServiceError),
 }
 
 /// Network service that manages peer discovery and connections
@@ -28,6 +31,7 @@ pub struct NetworkService {
     pub config: Config,
     pub peer_manager: PeerManager,
     pub dns_resolver: DnsSeedResolver,
+    pub relay_service: Option<TransactionRelayService>,
     pub is_running: bool,
 }
 
@@ -45,8 +49,15 @@ impl NetworkService {
             config,
             peer_manager,
             dns_resolver: DnsSeedResolver::new(),
+            relay_service: None,
             is_running: false,
         }
+    }
+
+    /// Set the transaction relay service (requires mempool and blockchain dependencies)
+    pub fn set_relay_service(&mut self, relay_service: TransactionRelayService) {
+        self.relay_service = Some(relay_service);
+        info!("Transaction relay service enabled");
     }
 
     /// Start the network service
@@ -196,6 +207,8 @@ impl NetworkService {
                 // Clean up timed out peers
                 _ = cleanup_interval.tick() => {
                     self.cleanup_timed_out_peers().await;
+                    // Also clean up relay service timeouts
+                    self.cleanup_relay_timeouts();
                 }
 
                 // Handle peer reconnections
@@ -318,6 +331,110 @@ impl NetworkService {
     pub async fn send_message_to_peer(&mut self, connection_id: &str, message: crate::network::message::Message) -> Result<(), NetworkServiceError> {
         self.peer_manager.send_message(connection_id, message).await?;
         Ok(())
+    }
+
+    /// Process a message from a peer and handle transaction relay if enabled
+    ///
+    /// This method processes the message through the peer manager first,
+    /// then routes transaction-related messages through the relay service.
+    /// Returns a list of (peer_id, message) tuples for messages to send.
+    pub async fn process_peer_message(&mut self, connection_id: &str, message: Message) -> Result<Vec<(String, Message)>, NetworkServiceError> {
+        let mut responses = Vec::new();
+
+        // First, let the peer handle the message (for keepalive, handshake, etc.)
+        if let Ok(Some(response)) = self.peer_manager.process_message(connection_id, message.clone()) {
+            responses.push((connection_id.to_string(), response));
+        }
+
+        // Then, if this is a transaction-related message and relay service is enabled, handle it
+        if let Some(ref mut relay_service) = self.relay_service {
+            match &message {
+                Message::Inv(inv_msg) => {
+                    debug!("Processing inv message from peer {}", connection_id);
+                    if let Ok(actions) = relay_service.process_inv(connection_id, inv_msg) {
+                        for action in actions {
+                            responses.extend(self.handle_relay_action(action)?);
+                        }
+                    }
+                }
+                Message::GetData(getdata_msg) => {
+                    debug!("Processing getdata message from peer {}", connection_id);
+                    if let Ok(actions) = relay_service.process_getdata(connection_id, getdata_msg) {
+                        for action in actions {
+                            responses.extend(self.handle_relay_action(action)?);
+                        }
+                    }
+                }
+                Message::Tx(tx_msg) => {
+                    debug!("Processing tx message from peer {}", connection_id);
+                    if let Ok(actions) = relay_service.process_tx(connection_id, tx_msg) {
+                        for action in actions {
+                            responses.extend(self.handle_relay_action(action)?);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(responses)
+    }
+
+    /// Handle a relay action and convert it to messages to send
+    fn handle_relay_action(&self, action: RelayAction) -> Result<Vec<(String, Message)>, NetworkServiceError> {
+        let mut messages = Vec::new();
+
+        match action {
+            RelayAction::SendToPeer { peer_id, message } => {
+                messages.push((peer_id, message));
+            }
+            RelayAction::Broadcast { peer_ids, message } => {
+                for peer_id in peer_ids {
+                    messages.push((peer_id, message.clone()));
+                }
+            }
+            RelayAction::None => {}
+        }
+
+        Ok(messages)
+    }
+
+    /// Notify the relay service that a peer has disconnected
+    pub fn handle_peer_disconnect(&mut self, connection_id: &str) {
+        if let Some(ref mut relay_service) = self.relay_service {
+            relay_service.peer_disconnected(connection_id);
+        }
+    }
+
+    /// Clean up timed-out transaction requests in the relay service
+    pub fn cleanup_relay_timeouts(&mut self) -> usize {
+        if let Some(ref mut relay_service) = self.relay_service {
+            let timed_out = relay_service.cleanup_timed_out_requests();
+            if !timed_out.is_empty() {
+                debug!("Cleaned up {} timed-out transaction requests", timed_out.len());
+            }
+            timed_out.len()
+        } else {
+            0
+        }
+    }
+
+    /// Announce a transaction to all peers (for locally created transactions)
+    ///
+    /// This should be called when the node creates or receives a transaction
+    /// from an external source (like RPC).
+    pub async fn announce_transaction(&mut self, tx: &bitcoin::Transaction) -> Result<Vec<(String, Message)>, NetworkServiceError> {
+        if let Some(ref mut relay_service) = self.relay_service {
+            let actions = relay_service.announce_transaction(tx)?;
+            let mut messages = Vec::new();
+            for action in actions {
+                messages.extend(self.handle_relay_action(action)?);
+            }
+            Ok(messages)
+        } else {
+            warn!("Transaction relay service not enabled, cannot announce transaction");
+            Ok(Vec::new())
+        }
     }
 }
 

@@ -98,6 +98,14 @@ pub struct GetDataMessage {
     pub inventory: Vec<InventoryVector>,
 }
 
+/// Inventory type constants for Bitcoin P2P protocol
+pub mod inventory_type {
+    pub const MSG_TX: u32 = 1;
+    pub const MSG_BLOCK: u32 = 2;
+    pub const MSG_FILTERED_BLOCK: u32 = 3;
+    pub const MSG_CMPCT_BLOCK: u32 = 4;
+}
+
 /// Inventory vector
 #[derive(Debug, Clone, PartialEq)]
 pub struct InventoryVector {
